@@ -212,6 +212,7 @@
   .group-head .count { font-weight: 500; text-transform: none; letter-spacing: 0; font-size: 12px; }
 
   .task-row-wrap { position: relative; overflow: hidden; border-bottom: 1px solid color-mix(in srgb, var(--border) 50%, transparent); }
+  .task-row-wrap[draggable="true"] .task-row { cursor: grab; }
   .task-row-strip {
     position: absolute; inset: 0; display: flex; align-items: center;
     font-size: 13px; font-weight: 600; color: #fff;
@@ -300,13 +301,14 @@
     position: fixed; left: 0; right: 0; bottom: 0; z-index: 50;
     max-width: 480px; margin: 0 auto; background: var(--bg);
     border-radius: 20px 20px 0 0; box-shadow: 0 -8px 32px rgba(0,0,0,0.2);
-    max-height: 90vh; overflow-y: auto;
+    height: min(90vh, 760px); overflow-y: auto;
+    overscroll-behavior: contain;
     transform: translate3d(0, 100%, 0); transition: transform 0.25s cubic-bezier(0.32, 0.72, 0, 1);
     will-change: transform;
   }
   .sheet.open { transform: translate3d(0, 0, 0); }
   .sheet-handle { width: 36px; height: 4px; background: color-mix(in srgb, var(--muted-fg) 30%, transparent); border-radius: 2px; margin: 12px auto 0; }
-  .sheet-body { padding: 0 20px 20px; }
+  .sheet-body { padding: 0 16px calc(28px + env(safe-area-inset-bottom)); min-height: 0; }
 
   .sheet-title-input {
     width: 100%; background: transparent; border: none; outline: none;
@@ -345,9 +347,9 @@
   .task-menu-item.destructive { color: var(--destructive); }
   .task-menu-item.destructive svg { color: var(--destructive); }
 
-  .compact-row { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+  .compact-row { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
   .compact-row .label { font-size: 12px; color: var(--muted-fg); width: 56px; flex-shrink: 0; }
-  .compact-row .chips { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; flex: 1; overflow: hidden; }
+  .compact-row .chips { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; flex: 1; overflow: auto; }
   .chip {
     flex-shrink: 0; padding: 4px 10px; border-radius: 999px; border: none;
     font-size: 11px; font-weight: 600; cursor: pointer; font-family: inherit;
@@ -411,7 +413,11 @@
     font-size: 13px; font-weight: 600; color: var(--fg); cursor: pointer; font-family: inherit;
   }
 
-  .sheet-foot { display: flex; align-items: center; justify-content: space-between; margin-top: 16px; }
+  .sheet-foot {
+    position: sticky; bottom: 0; z-index: 2;
+    display: flex; align-items: center; justify-content: space-between; margin-top: 16px;
+    padding-top: 10px; background: linear-gradient(to top, var(--bg) 72%, transparent);
+  }
   .sheet-foot-left { display: flex; align-items: center; gap: 4px; }
   .btn-text { background: none; border: none; font-size: 14px; font-weight: 600; cursor: pointer; font-family: inherit; padding: 10px 8px; }
   .btn-text.muted { color: var(--muted-fg); }
@@ -643,7 +649,10 @@ const WEEKDAYS = ["sunday","monday","tuesday","wednesday","thursday","friday","s
 const WEEKDAYS_SHORT = ["sun","mon","tue","wed","thu","fri","sat"];
 
 // --- State ---
-let state = { tasks: [], projects: [], orderSeq: 0 };
+let state = {
+  tasks: [], projects: [], orderSeq: 0,
+  sortPrefs: {}, archiveAfterDays: 30, notifications: { due: false, digest: false, lastDigestDate: null },
+};
 let sidebarOpen = false;
 let selection = { kind: "smart", id: "today" };
 let tab = "list";
@@ -652,11 +661,16 @@ let editingId = null;
 let focusSearchOnOpen = false;
 let calYear, calMonth, calSelectedDate = null;
 let toastTimer = null;
+let dueTimer = null;
+let digestTimer = null;
+let selectionMode = false;
+let selectedTaskIds = new Set();
+let draggingTaskId = null;
 
 // Draft fields for the sheet
 let draft = {
   title: "", notes: "", priority: "none", status: "pending",
-  date: null, repeat: "none", projectId: null, tags: [], subtasks: [],
+  date: null, time: null, repeat: "none", repeatEvery: 1, repeatUntil: null, projectId: null, tags: [], subtasks: [],
 };
 let draftTouched = { date: false, priority: false, repeat: false, project: false };
 let showMore = false;
@@ -670,15 +684,23 @@ function load() {
   if (!state.tasks) state.tasks = [];
   if (!state.projects) state.projects = [];
   if (!state.orderSeq) state.orderSeq = 0;
+  if (!state.sortPrefs) state.sortPrefs = {};
+  if (!state.archiveAfterDays) state.archiveAfterDays = 30;
+  if (!state.notifications) state.notifications = { due: false, digest: false, lastDigestDate: null };
   // Migration: ensure all fields
   state.tasks.forEach(t => {
     if (!t.priority) t.priority = "none";
     if (!t.status) t.status = t.done ? "done" : "pending";
     if (t.date === undefined) t.date = null;
+    if (t.time === undefined) t.time = null;
     if (!t.repeat) t.repeat = "none";
+    if (t.repeatEvery === undefined || t.repeatEvery < 1) t.repeatEvery = 1;
+    if (t.repeatUntil === undefined) t.repeatUntil = null;
     if (t.projectId === undefined) t.projectId = null;
     if (!t.tags) t.tags = [];
     if (!t.subtasks) t.subtasks = [];
+    if (t.archived === undefined) t.archived = false;
+    if (t.notifiedDueAt === undefined) t.notifiedDueAt = null;
     if (t.completedAt === undefined) t.completedAt = null;
     if (t.lastAdvanced === undefined) t.lastAdvanced = null;
   });
@@ -703,6 +725,21 @@ function parseIso(iso) {
   const [y, m, d] = iso.split("-").map(Number);
   if (!y || !m || !d) return null;
   return new Date(y, m - 1, d);
+}
+function parseTimeToMinutes(value) {
+  if (!value || !/^\d{2}:\d{2}$/.test(value)) return null;
+  const [h, m] = value.split(":").map(Number);
+  if (h < 0 || h > 23 || m < 0 || m > 59) return null;
+  return h * 60 + m;
+}
+function fmtTime(value) {
+  const mins = parseTimeToMinutes(value);
+  if (mins === null) return "";
+  const h24 = Math.floor(mins / 60);
+  const m = mins % 60;
+  const h12 = ((h24 + 11) % 12) + 1;
+  const ampm = h24 >= 12 ? "PM" : "AM";
+  return `${h12}:${String(m).padStart(2, "0")} ${ampm}`;
 }
 function addDays(iso, n) {
   const d = parseIso(iso); if (!d) return iso;
@@ -742,11 +779,12 @@ function nextWeekday(targetDow, from) {
   d.setDate(d.getDate() + diff);
   return isoDate(d);
 }
-function advanceRecurringDate(iso, repeat) {
+function advanceRecurringDate(iso, repeat, repeatEvery) {
   if (repeat === "none") return null;
-  if (repeat === "daily") return addDays(iso, 1);
-  if (repeat === "weekly") return addDays(iso, 7);
-  if (repeat === "monthly") return addMonths(iso, 1);
+  const every = Math.max(repeatEvery || 1, 1);
+  if (repeat === "daily") return addDays(iso, 1 * every);
+  if (repeat === "weekly") return addDays(iso, 7 * every);
+  if (repeat === "monthly") return addMonths(iso, 1 * every);
   if (repeat === "weekdays") {
     const d = parseIso(iso); if (!d) return addDays(iso, 1);
     const dow = d.getDay();
@@ -760,7 +798,7 @@ function advanceRecurringDate(iso, repeat) {
 // --- Quick-add parser ---
 function parseQuickAdd(raw) {
   let text = raw;
-  let date = null, priority = null, repeat = null;
+  let date = null, time = null, priority = null, repeat = null, repeatEvery = 1, repeatUntil = null;
   const tags = [];
   text = text.replace(/#([a-zA-Z0-9_-]{1,20})\b/g, (_, tag) => { tags.push(tag.toLowerCase()); return ""; });
   const priMatch = text.match(/\b(high|medium|low)(\s+priority)?\b/i);
@@ -768,10 +806,12 @@ function parseQuickAdd(raw) {
     priority = priMatch[1].toLowerCase();
     text = text.slice(0, priMatch.index) + text.slice(priMatch.index + priMatch[0].length);
   }
-  const everyMatch = text.match(/\bevery\s+(day|week|month|weekday|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/i);
+  const everyMatch = text.match(/\bevery\s+(\d+\s+)?(day|week|month|weekday|monday|tuesday|wednesday|thursday|friday|saturday|sunday)s?\b/i);
   let everyWeekdayIdx = null;
   if (everyMatch) {
-    const word = everyMatch[1].toLowerCase();
+    const intervalRaw = (everyMatch[1] || "").trim();
+    const word = everyMatch[2].toLowerCase();
+    repeatEvery = Math.max(parseInt(intervalRaw || "1", 10), 1);
     if (word === "day") repeat = "daily";
     else if (word === "week") repeat = "weekly";
     else if (word === "month") repeat = "monthly";
@@ -783,9 +823,24 @@ function parseQuickAdd(raw) {
     if (dm) { repeat = dm[1].toLowerCase(); text = text.slice(0, dm.index) + text.slice(dm.index + dm[0].length); }
   }
   const today = todayIso();
+  const timeMatch = text.match(/\b(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b/i) || text.match(/\bat\s+([01]?\d|2[0-3]):([0-5]\d)\b/i);
+  if (timeMatch) {
+    if (timeMatch[3]) {
+      const h = parseInt(timeMatch[1], 10);
+      const m = parseInt(timeMatch[2] || "0", 10);
+      const ampm = timeMatch[3].toLowerCase();
+      let hh = h % 12;
+      if (ampm === "pm") hh += 12;
+      time = `${String(hh).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
+    } else {
+      time = `${String(parseInt(timeMatch[1], 10)).padStart(2, "0")}:${String(parseInt(timeMatch[2], 10)).padStart(2, "0")}`;
+    }
+    text = text.replace(timeMatch[0], "");
+  }
   if (/\btoday\b/i.test(text)) { date = today; text = text.replace(/\btoday\b/i, ""); }
   else if (/\btomorrow\b/i.test(text) || /\btmrw\b/i.test(text)) { date = addDays(today, 1); text = text.replace(/\btomorrow\b/i, "").replace(/\btmrw\b/i, ""); }
   else if (/\byesterday\b/i.test(text)) { date = addDays(today, -1); text = text.replace(/\byesterday\b/i, ""); }
+  else if (/\bnext\s+week\b/i.test(text)) { date = addDays(today, 7); text = text.replace(/\bnext\s+week\b/i, ""); }
   else {
     const nm = text.match(/\bnext\s+(sunday|monday|tuesday|wednesday|thursday|friday|saturday)\b/i);
     if (nm) {
@@ -810,11 +865,17 @@ function parseQuickAdd(raw) {
       }
     }
   }
+  const repeatForMatch = text.match(/\bfor\s+(\d+)\s+weeks?\b/i);
+  if (repeatForMatch && repeat && date) {
+    const weeks = Math.max(parseInt(repeatForMatch[1], 10), 1);
+    repeatUntil = addDays(date, weeks * 7);
+    text = text.replace(repeatForMatch[0], "");
+  }
   text = text.replace(/\s{2,}/g, " ").trim();
   if (repeat && !date) {
     date = everyWeekdayIdx !== null ? nextWeekday(everyWeekdayIdx) : today;
   }
-  return { title: text, date, priority, repeat, tags };
+  return { title: text, date, time, priority, repeat, repeatEvery, repeatUntil, tags };
 }
 
 // --- Recurring task advancement ---
@@ -826,16 +887,18 @@ function advanceRecurring() {
     if (t.repeat === "none" || !t.date) continue;
     if (t.date >= today) continue; // only advance once the due date has actually passed
     if (t.lastAdvanced === t.date) continue;
-    let nextDate = advanceRecurringDate(t.date, t.repeat);
+    let nextDate = advanceRecurringDate(t.date, t.repeat, t.repeatEvery);
     // Catch up fully in one pass (e.g. app wasn't opened for several days)
     while (nextDate && nextDate < today) {
-      nextDate = advanceRecurringDate(nextDate, t.repeat);
+      nextDate = advanceRecurringDate(nextDate, t.repeat, t.repeatEvery);
     }
     if (!nextDate) continue;
+    if (t.repeatUntil && nextDate > t.repeatUntil) continue;
     additions.push({
       ...t, id: makeId(), date: nextDate, status: "pending", completedAt: null,
       lastAdvanced: null, createdAt: Date.now(),
       order: state.orderSeq + 1 + additions.length,
+      notifiedDueAt: null,
       subtasks: t.subtasks.map(s => ({ ...s, done: false, id: makeId() })),
     });
     t.lastAdvanced = t.date;
@@ -855,33 +918,50 @@ function addTask(input) {
   const task = {
     id, title: input.title, notes: input.notes || "",
     priority: input.priority || "none", status: input.status || "pending",
-    date: input.date || null, repeat: input.repeat || "none",
+    date: input.date || null, time: input.time || null,
+    repeat: input.repeat || "none", repeatEvery: Math.max(input.repeatEvery || 1, 1), repeatUntil: input.repeatUntil || null,
     projectId: input.projectId || null, tags: input.tags || [],
     subtasks: input.subtasks || [], order,
+    archived: false, notifiedDueAt: null,
     createdAt: Date.now(), completedAt: input.status === "done" ? Date.now() : null,
   };
   state.tasks.push(task);
   state.orderSeq = order;
   save();
+  scheduleDueReminder();
   return task;
 }
 function updateTask(id, patch) {
   const t = state.tasks.find(x => x.id === id); if (!t) return;
   Object.assign(t, patch);
+  if (patch.date !== undefined || patch.time !== undefined || patch.status !== undefined) {
+    t.notifiedDueAt = null;
+  }
   if (patch.status !== undefined) {
     t.completedAt = patch.status === "done" ? (t.completedAt || Date.now()) : null;
   }
   save();
+  scheduleDueReminder();
 }
 function deleteTask(id) {
-  state.tasks = state.tasks.filter(t => t.id !== id);
+  const cutoffDays = Math.max(state.archiveAfterDays || 30, 1);
+  const cutoffMs = cutoffDays * 86400000;
+  const t = state.tasks.find(x => x.id === id);
+  if (t && t.status === "done" && t.completedAt && (Date.now() - t.completedAt) >= cutoffMs) {
+    t.archived = true;
+  } else {
+    state.tasks = state.tasks.filter(task => task.id !== id);
+  }
   save();
+  scheduleDueReminder();
 }
 function toggleDone(id) {
   const t = state.tasks.find(x => x.id === id); if (!t) return;
   t.status = t.status === "done" ? "pending" : "done";
   t.completedAt = t.status === "done" ? (t.completedAt || Date.now()) : null;
+  t.notifiedDueAt = null;
   save();
+  scheduleDueReminder();
   render();
 }
 function duplicateTask(id) {
@@ -890,6 +970,7 @@ function duplicateTask(id) {
   const copy = {
     ...orig, id: makeId(), title: orig.title + " (copy)", status: "pending",
     completedAt: null, createdAt: Date.now(), order,
+    archived: false, notifiedDueAt: null,
     subtasks: orig.subtasks.map(s => ({ ...s, id: makeId(), done: false })),
     lastAdvanced: null,
   };
@@ -914,27 +995,100 @@ function deleteProject(id) {
   state.tasks.forEach(t => { if (t.projectId === id) t.projectId = null; });
   save();
 }
+function toggleSelectionMode() {
+  selectionMode = !selectionMode;
+  if (!selectionMode) selectedTaskIds.clear();
+  render();
+}
+function toggleTaskSelection(id) {
+  if (selectedTaskIds.has(id)) selectedTaskIds.delete(id);
+  else selectedTaskIds.add(id);
+  render();
+}
+function bulkComplete() {
+  state.tasks.forEach(t => { if (selectedTaskIds.has(t.id)) { t.status = "done"; t.completedAt = t.completedAt || Date.now(); t.notifiedDueAt = null; } });
+  save();
+  scheduleDueReminder();
+  render();
+}
+function bulkMoveTomorrow() {
+  const tomorrow = addDays(todayIso(), 1);
+  state.tasks.forEach(t => { if (selectedTaskIds.has(t.id)) { t.date = tomorrow; t.notifiedDueAt = null; } });
+  save();
+  scheduleDueReminder();
+  render();
+}
+function bulkDelete() {
+  const ids = new Set(selectedTaskIds);
+  state.tasks = state.tasks.filter(t => !ids.has(t.id));
+  selectedTaskIds.clear();
+  save();
+  scheduleDueReminder();
+  render();
+}
+function onTaskDragStart(e, taskId) {
+  draggingTaskId = taskId;
+  e.dataTransfer.effectAllowed = "move";
+  try { e.dataTransfer.setData("text/plain", taskId); } catch (err) {}
+}
+function onTaskDragOver(e) {
+  e.preventDefault();
+  e.dataTransfer.dropEffect = "move";
+}
+function onTaskDrop(e, targetId) {
+  e.preventDefault();
+  if (!draggingTaskId || draggingTaskId === targetId) return;
+  const visible = getFilteredTasks().filter(t => t.status !== "done");
+  const from = visible.findIndex(t => t.id === draggingTaskId);
+  const to = visible.findIndex(t => t.id === targetId);
+  if (from < 0 || to < 0) return;
+  const moved = visible.splice(from, 1)[0];
+  visible.splice(to, 0, moved);
+  visible.forEach((t, i) => {
+    const task = state.tasks.find(x => x.id === t.id);
+    if (task) task.order = i + 1;
+  });
+  state.orderSeq = Math.max(state.orderSeq, visible.length);
+  save();
+  render();
+}
+function onTaskDragEnd() {
+  draggingTaskId = null;
+}
 
 // --- Filtering ---
+function sortPrefKey() {
+  return `${selection.kind}:${selection.id}`;
+}
+function getSortMode() {
+  return state.sortPrefs[sortPrefKey()] || "priority";
+}
+function setSortMode(mode) {
+  state.sortPrefs[sortPrefKey()] = mode;
+  save();
+  render();
+}
 function getFilteredTasks() {
   const today = todayIso();
   const next7 = addDays(today, 7);
   let list;
+  const base = state.tasks.filter(t => !t.archived);
   switch (selection.kind) {
     case "smart":
       switch (selection.id) {
-        case "inbox": list = state.tasks.filter(t => t.projectId === null); break;
-        case "today": list = state.tasks.filter(t => t.date === today || (t.date && t.date < today && t.status !== "done")); break;
-        case "upcoming": list = state.tasks.filter(t => t.date && t.date > today && t.date <= next7); break;
-        case "anytime": list = state.tasks.filter(t => !t.date && t.priority !== "none"); break;
-        case "someday": list = state.tasks.filter(t => !t.date && t.priority === "none"); break;
-        case "completed": list = state.tasks.filter(t => t.status === "done"); break;
-        default: list = state.tasks.slice(); break;
+        case "inbox": list = base.filter(t => t.projectId === null); break;
+        case "today": list = base.filter(t => t.date === today || (t.date && t.date < today && t.status !== "done")); break;
+        case "upcoming": list = base.filter(t => t.date && t.date > today && t.date <= next7); break;
+        case "anytime": list = base.filter(t => !t.date && t.priority !== "none"); break;
+        case "someday": list = base.filter(t => !t.date && t.priority === "none"); break;
+        case "focus": list = base.filter(t => t.status !== "done").slice(); break;
+        case "completed": list = base.filter(t => t.status === "done"); break;
+        default: list = base.slice(); break;
       }
       break;
-    case "project": list = state.tasks.filter(t => t.projectId === selection.id); break;
-    case "tag": list = state.tasks.filter(t => t.tags.includes(selection.id)); break;
-    default: list = state.tasks.slice();
+    case "project": list = base.filter(t => t.projectId === selection.id); break;
+    case "tag": list = base.filter(t => t.tags.includes(selection.id)); break;
+    default: list = base.slice();
   }
   if (search.trim()) {
     const q = search.toLowerCase();
@@ -944,16 +1098,39 @@ function getFilteredTasks() {
       t.tags.some(tag => tag.includes(q))
     );
   }
+  const sortMode = getSortMode();
   list.sort((a, b) => {
     if (a.status === "done" && b.status !== "done") return 1;
     if (a.status !== "done" && b.status === "done") return -1;
+    if (sortMode === "manual") return a.order - b.order;
+    if (sortMode === "date") {
+      if (a.date && b.date) {
+        const byDate = a.date.localeCompare(b.date);
+        if (byDate !== 0) return byDate;
+        if (a.time && b.time) return (parseTimeToMinutes(a.time) || 0) - (parseTimeToMinutes(b.time) || 0);
+        if (a.time && !b.time) return -1;
+        if (!a.time && b.time) return 1;
+      }
+      if (a.date && !b.date) return -1;
+      if (!a.date && b.date) return 1;
+      const pa = PRIORITY_ORDER[a.priority], pb = PRIORITY_ORDER[b.priority];
+      if (pa !== pb) return pa - pb;
+      return a.order - b.order;
+    }
     const pa = PRIORITY_ORDER[a.priority], pb = PRIORITY_ORDER[b.priority];
     if (pa !== pb) return pa - pb;
-    if (a.date && b.date) return a.date.localeCompare(b.date);
+    if (a.date && b.date) {
+      const byDate = a.date.localeCompare(b.date);
+      if (byDate !== 0) return byDate;
+      if (a.time && b.time) return (parseTimeToMinutes(a.time) || 0) - (parseTimeToMinutes(b.time) || 0);
+      if (a.time && !b.time) return -1;
+      if (!a.time && b.time) return 1;
+    }
     if (a.date && !b.date) return -1;
     if (!a.date && b.date) return 1;
     return a.order - b.order;
   });
+  if (selection.kind === "smart" && selection.id === "focus") list = list.slice(0, 3);
   return list;
 }
 
@@ -962,23 +1139,26 @@ function renderSidebar() {
   const body = document.getElementById("sidebar-body");
   const today = todayIso();
   const next7 = addDays(today, 7);
+  const activeTasks = state.tasks.filter(t => !t.archived);
   const counts = {
-    inbox: state.tasks.filter(t => t.projectId === null && t.status !== "done").length,
-    today: state.tasks.filter(t => t.date === today && t.status !== "done").length,
-    upcoming: state.tasks.filter(t => t.date && t.date > today && t.date <= next7 && t.status !== "done").length,
-    anytime: state.tasks.filter(t => !t.date && t.status !== "done" && t.priority !== "none").length,
-    someday: state.tasks.filter(t => !t.date && t.status !== "done" && t.priority === "none").length,
-    completed: state.tasks.filter(t => t.status === "done").length,
-    all: state.tasks.filter(t => t.status !== "done").length,
+    inbox: activeTasks.filter(t => t.projectId === null && t.status !== "done").length,
+    today: activeTasks.filter(t => t.date === today && t.status !== "done").length,
+    upcoming: activeTasks.filter(t => t.date && t.date > today && t.date <= next7 && t.status !== "done").length,
+    anytime: activeTasks.filter(t => !t.date && t.status !== "done" && t.priority !== "none").length,
+    someday: activeTasks.filter(t => !t.date && t.status !== "done" && t.priority === "none").length,
+    focus: activeTasks.filter(t => t.status !== "done").length,
+    completed: activeTasks.filter(t => t.status === "done").length,
+    all: activeTasks.filter(t => t.status !== "done").length,
   };
   const tagCounts = {};
-  state.tasks.forEach(t => { if (t.status !== "done") t.tags.forEach(tag => tagCounts[tag] = (tagCounts[tag] || 0) + 1); });
+  state.tasks.forEach(t => { if (!t.archived && t.status !== "done") t.tags.forEach(tag => tagCounts[tag] = (tagCounts[tag] || 0) + 1); });
   const tagList = Object.entries(tagCounts).sort((a, b) => a[0].localeCompare(b[0]));
 
   const smartItems = [
     { id: "inbox", label: "Inbox", icon: inboxIcon(), count: counts.inbox },
     { id: "today", label: "Today", icon: todayIcon(), count: counts.today, color: "var(--today-accent)" },
     { id: "upcoming", label: "Upcoming", icon: upcomingIcon(), count: counts.upcoming },
+    { id: "focus", label: "Focus", icon: todayIcon(), count: Math.min(counts.focus, 3), color: "var(--today-accent)" },
     { id: "anytime", label: "Anytime", icon: anytimeIcon(), count: counts.anytime },
     { id: "someday", label: "Someday", icon: somedayIcon(), count: counts.someday },
     { id: "all", label: "All Tasks", icon: allIcon(), count: counts.all },
@@ -1006,7 +1186,7 @@ function renderSidebar() {
   } else {
     state.projects.forEach(p => {
       const active = selection.kind === "project" && selection.id === p.id;
-      const count = state.tasks.filter(t => t.projectId === p.id && t.status !== "done").length;
+      const count = state.tasks.filter(t => !t.archived && t.projectId === p.id && t.status !== "done").length;
       html += `<button class="sidebar-item ${active ? "active" : ""}" onclick="selectView({kind:'project',id:'${p.id}'})">`;
       html += `<span class="dot" style="background:${p.color}"></span>`;
       if (p.emoji) html += `<span class="emoji">${p.emoji}</span>`;
@@ -1104,6 +1284,25 @@ function renderTaskList() {
   }
 
   let html = `<div class="page-header"><h1>${esc(headerInfo.title)}</h1><p class="sub">${esc(headerInfo.sub)}</p></div>`;
+  html += `<div class="group-head" style="padding-top:0;text-transform:none;letter-spacing:0;font-size:12px">
+    <span>Sort</span>
+    <div style="display:flex;gap:6px">
+      <button class="chip ${getSortMode() === "priority" ? "active" : ""}" onclick="setSortMode('priority')">Priority</button>
+      <button class="chip ${getSortMode() === "date" ? "active" : ""}" onclick="setSortMode('date')">Date</button>
+      <button class="chip ${getSortMode() === "manual" ? "active" : ""}" onclick="setSortMode('manual')">Manual</button>
+    </div>
+    <span style="flex:1"></span>
+    <button class="chip ${selectionMode ? "active" : ""}" onclick="toggleSelectionMode()">${selectionMode ? "Done" : "Select"}</button>
+  </div>`;
+  if (selectionMode) {
+    html += `<div class="group-head" style="padding-top:0;text-transform:none;letter-spacing:0;font-size:12px">
+      <span>${selectedTaskIds.size} selected</span>
+      <span style="flex:1"></span>
+      <button class="chip" onclick="bulkComplete()">Complete</button>
+      <button class="chip" onclick="bulkMoveTomorrow()">Tomorrow</button>
+      <button class="chip" onclick="bulkDelete()">Delete</button>
+    </div>`;
+  }
   groups.forEach(group => {
     if (group.label) {
       html += `<div class="group-head"><span style="color:${group.color || "var(--muted-fg)"}">${esc(group.label)}</span><span class="count">${group.tasks.length}</span></div>`;
@@ -1116,7 +1315,13 @@ function renderTaskList() {
   document.querySelectorAll(".task-row-wrap").forEach(wrap => {
     const id = wrap.dataset.id;
     const row = wrap.querySelector(".task-row");
-    attachRowGestures(row, id);
+    if (!selectionMode) attachRowGestures(row, id);
+    if (getSortMode() === "manual" && !selectionMode) {
+      wrap.addEventListener("dragstart", e => onTaskDragStart(e, id));
+      wrap.addEventListener("dragover", onTaskDragOver);
+      wrap.addEventListener("drop", e => onTaskDrop(e, id));
+      wrap.addEventListener("dragend", onTaskDragEnd);
+    }
   });
 }
 
@@ -1126,6 +1331,7 @@ function getHeaderInfo(filtered) {
       inbox: { title: "Inbox", sub: "Things you haven't filed yet" },
       today: { title: "Today", sub: "" },
       upcoming: { title: "Upcoming", sub: "Next 7 days" },
+      focus: { title: "Focus", sub: "Top 3 tasks" },
       anytime: { title: "Anytime", sub: "No date, has priority" },
       someday: { title: "Someday", sub: "No date, no rush" },
       all: { title: "All Tasks", sub: "" },
@@ -1167,18 +1373,21 @@ function buildTaskRow(t) {
   }
   t.tags.forEach(tag => { meta += `<span class="meta-tag">#${esc(tag)}</span>`; });
   if (t.date) {
-    meta += `<span class="meta-date ${overdue ? "overdue" : ""}">${fmtDate(t.date)}${t.repeat !== "none" ? " ↻" : ""}</span>`;
+    const timeLabel = t.time ? ` · ${fmtTime(t.time)}` : "";
+    meta += `<span class="meta-date ${overdue ? "overdue" : ""}">${fmtDate(t.date)}${timeLabel}${t.repeat !== "none" ? " ↻" : ""}</span>`;
   }
   if (subTotal > 0) {
     meta += `<span class="meta-subtask"><span class="bar"><span style="width:${subPct}%"></span></span>${subDone}/${subTotal}</span>`;
   }
 
   return `
-    <div class="task-row-wrap" data-id="${t.id}">
+    <div class="task-row-wrap" data-id="${t.id}" draggable="${selectionMode || getSortMode() !== "manual" || t.status === "done" ? "false" : "true"}">
       <div class="task-row-strip done"><span style="display:inline-flex;align-items:center;gap:6px">${checkIcon().replace("<svg", "<svg style='width:14px;height:14px'")} ${done ? "Undo" : "Done"}</span></div>
       <div class="task-row-strip delete">Delete</div>
       <div class="task-row ${done ? "completed" : ""}" data-id="${t.id}">
-        <button class="checkbox ${done ? "done" : ""}" data-checkbox="true" onclick="event.stopPropagation();toggleDone('${t.id}')">${done ? checkIcon() : ""}</button>
+        ${selectionMode
+          ? `<button class="checkbox ${selectedTaskIds.has(t.id) ? "done" : ""}" data-checkbox="true" onclick="event.stopPropagation();toggleTaskSelection('${t.id}')">${selectedTaskIds.has(t.id) ? checkIcon() : ""}</button>`
+          : `<button class="checkbox ${done ? "done" : ""}" data-checkbox="true" onclick="event.stopPropagation();toggleDone('${t.id}')">${done ? checkIcon() : ""}</button>`}
         <div class="pri-bar" style="background:${PRIORITY_COLOR[t.priority]};opacity:${done ? 0.3 : 1}"></div>
         <div class="task-text">
           <div class="task-title">${esc(t.title)}</div>
@@ -1353,6 +1562,9 @@ function renderCalendar() {
   const selTasks = (tasksByDate[calSelectedDate] || []).slice().sort((a, b) => {
     if (a.status === "done" && b.status !== "done") return 1;
     if (a.status !== "done" && b.status === "done") return -1;
+    if (a.time && b.time) return (parseTimeToMinutes(a.time) || 0) - (parseTimeToMinutes(b.time) || 0);
+    if (a.time && !b.time) return -1;
+    if (!a.time && b.time) return 1;
     return a.order - b.order;
   });
   html += `<div class="day-detail"><div style="display:flex;align-items:center;justify-content:space-between"><div class="day-detail-label">${fmtDateLong(calSelectedDate)}</div><button class="add-link" onclick="openAddOnDate('${calSelectedDate}')">+ Add</button></div>`;
@@ -1381,7 +1593,7 @@ function calSelect(iso) { calSelectedDate = iso; renderCalendar(); }
 // --- Sheet ---
 function openAddSheet() {
   editingId = null;
-  draft = { title: "", notes: "", priority: "none", status: "pending", date: null, repeat: "none", projectId: selection.kind === "project" ? selection.id : null, tags: [], subtasks: [] };
+  draft = { title: "", notes: "", priority: "none", status: "pending", date: null, time: null, repeat: "none", repeatEvery: 1, repeatUntil: null, projectId: selection.kind === "project" ? selection.id : null, tags: [], subtasks: [] };
   draftTouched = { date: false, priority: false, repeat: false, project: false };
   showMore = false;
   renderSheet();
@@ -1402,7 +1614,9 @@ function openTaskMenu(taskId) {
     <button class="task-menu-item" onclick="taskMenuAction('edit')">${editPencilIcon()}<span>Edit details</span></button>
     <button class="task-menu-item" onclick="taskMenuAction('today')">${todayIcon()}<span>Move to Today</span></button>
     <button class="task-menu-item" onclick="taskMenuAction('tomorrow')">${upcomingIcon()}<span>Move to Tomorrow</span></button>
+    <button class="task-menu-item" onclick="taskMenuAction('snooze')">${upcomingIcon()}<span>Snooze to tomorrow</span></button>
     <button class="task-menu-item" onclick="taskMenuAction('anytime')">${layersIcon()}<span>Move to Anytime</span></button>
+    <button class="task-menu-item" onclick="taskMenuAction('select')">${layersIcon()}<span>Select multiple</span></button>
     <div class="task-menu-divider"></div>
     <button class="task-menu-item destructive" onclick="taskMenuAction('delete')">${trashIcon()}<span>Delete</span></button>
   `;
@@ -1428,8 +1642,14 @@ function taskMenuAction(action) {
     updateTask(id, { date: todayIso() }); render();
   } else if (action === "tomorrow") {
     updateTask(id, { date: isoDate(new Date(Date.now() + 86400000)) }); render();
+  } else if (action === "snooze") {
+    updateTask(id, { date: isoDate(new Date(Date.now() + 86400000)), status: "pending" }); render();
   } else if (action === "anytime") {
     updateTask(id, { date: null, priority: t.priority === "none" ? "low" : t.priority }); render();
+  } else if (action === "select") {
+    selectionMode = true;
+    selectedTaskIds.add(id);
+    render();
   } else if (action === "delete") {
     const snap = snapshot();
     deleteTask(id);
@@ -1441,7 +1661,7 @@ function openEditSheet(id) {
   const t = state.tasks.find(x => x.id === id); if (!t) return;
   closeTaskMenu();
   editingId = id;
-  draft = { title: t.title, notes: t.notes || "", priority: t.priority, status: t.status, date: t.date, repeat: t.repeat, projectId: t.projectId, tags: [...t.tags], subtasks: t.subtasks.map(s => ({ ...s })) };
+  draft = { title: t.title, notes: t.notes || "", priority: t.priority, status: t.status, date: t.date, time: t.time || null, repeat: t.repeat, repeatEvery: t.repeatEvery || 1, repeatUntil: t.repeatUntil || null, projectId: t.projectId, tags: [...t.tags], subtasks: t.subtasks.map(s => ({ ...s })) };
   draftTouched = { date: false, priority: false, repeat: false, project: false };
   showMore = false;
   renderSheet();
@@ -1449,7 +1669,7 @@ function openEditSheet(id) {
 }
 function openAddOnDate(date) {
   editingId = null;
-  draft = { title: "", notes: "", priority: "none", status: "pending", date, repeat: "none", projectId: null, tags: [], subtasks: [] };
+  draft = { title: "", notes: "", priority: "none", status: "pending", date, time: null, repeat: "none", repeatEvery: 1, repeatUntil: null, projectId: null, tags: [], subtasks: [] };
   draftTouched = { date: true, priority: false, repeat: false, project: false };
   showMore = false;
   renderSheet();
@@ -1502,6 +1722,12 @@ function renderSheet() {
   html += `<input id="date-picker" type="date" value="${draft.date || ""}" style="position:absolute;width:1px;height:1px;opacity:0" onchange="setDate(this.value)" oninput="setDate(this.value)">`;
   html += `</div></div>`;
 
+  // Time
+  html += `<div class="compact-row"><span class="label">Time</span><div class="chips">`;
+  html += `<input type="time" value="${draft.time || ""}" style="background:var(--muted);border:none;border-radius:999px;padding:6px 10px;color:var(--fg);font-family:inherit" onchange="setTime(this.value)">`;
+  if (draft.time) html += `<button class="chip" onclick="setTime('')">Clear</button>`;
+  html += `</div></div>`;
+
   // Project (compact)
   html += `<div class="compact-row"><span class="label">Project</span><div class="chips" style="overflow-x:auto">`;
   html += `<button class="chip ${draft.projectId === null ? "active" : ""}" onclick="setProject(null)">Inbox</button>`;
@@ -1521,6 +1747,10 @@ function renderSheet() {
         html += `<button class="seg-opt ${draft.repeat === v ? "selected" : ""}" onclick="setRepeat('${v}')">${l}</button>`;
       });
       html += `</div></div>`;
+      if (draft.repeat !== "none") {
+        html += `<div class="field-row"><div class="field-label">Every</div><div class="chips"><input type="number" min="1" max="52" value="${draft.repeatEvery || 1}" style="width:72px;background:var(--muted);border:none;border-radius:8px;padding:7px 10px;color:var(--fg)" onchange="setRepeatEvery(this.value)"><span style="font-size:12px;color:var(--muted-fg)">interval</span></div></div>`;
+        html += `<div class="field-row"><div class="field-label">End</div><div class="chips"><input type="date" value="${draft.repeatUntil || ""}" style="background:var(--muted);border:none;border-radius:8px;padding:7px 10px;color:var(--fg)" onchange="setRepeatUntil(this.value)"><button class="chip" onclick="setRepeatUntil('')">None</button></div></div>`;
+      }
     }
     html += `<div class="field-row"><div class="field-label">${checkIcon().replace("<svg", "<svg style='width:16px;height:16px'")} Status</div><div class="seg-picker">`;
     [["pending","Pending"],["ongoing","In Progress"],["done","Done"]].forEach(([v, l]) => {
@@ -1567,8 +1797,11 @@ function onTitleInput(val) {
   const parsed = parseQuickAdd(val);
   let changed = false;
   if (parsed.date && !draftTouched.date) { draft.date = parsed.date; changed = true; }
+  if (parsed.time && !draftTouched.date) { draft.time = parsed.time; changed = true; }
   if (parsed.priority && !draftTouched.priority) { draft.priority = parsed.priority; changed = true; }
   if (parsed.repeat && !draftTouched.repeat) { draft.repeat = parsed.repeat; changed = true; }
+  if (parsed.repeatEvery && !draftTouched.repeat) { draft.repeatEvery = parsed.repeatEvery; changed = true; }
+  if (parsed.repeatUntil && !draftTouched.repeat) { draft.repeatUntil = parsed.repeatUntil; changed = true; }
   if (parsed.tags.length) {
     const newTags = parsed.tags.filter(t => !draft.tags.includes(t));
     if (newTags.length) { draft.tags = [...draft.tags, ...newTags]; changed = true; }
@@ -1605,7 +1838,10 @@ function onTitleInput(val) {
 function setPriority(p) { draftTouched.priority = true; draft.priority = p; renderSheet(); setTimeout(() => document.getElementById("sheet-title-input")?.focus(), 0); }
 function setStatus(s) { draft.status = s; renderSheet(); }
 function setRepeat(r) { draftTouched.repeat = true; draft.repeat = r; renderSheet(); }
+function setRepeatEvery(v) { draftTouched.repeat = true; draft.repeatEvery = Math.max(parseInt(v || "1", 10), 1); }
+function setRepeatUntil(v) { draftTouched.repeat = true; draft.repeatUntil = v || null; renderSheet(); }
 function setProject(id) { draftTouched.project = true; draft.projectId = id; renderSheet(); }
+function setTime(v) { draft.time = v || null; renderSheet(); }
 function openDatePicker() {
   const input = document.getElementById("date-picker");
   if (!input) return;
@@ -1640,9 +1876,9 @@ function saveSheet() {
   const title = draft.title.trim(); if (!title) return;
   const notes = draft.notes.trim();
   if (editingId) {
-    updateTask(editingId, { title, notes, priority: draft.priority, status: draft.status, date: draft.date, repeat: draft.repeat, projectId: draft.projectId, tags: draft.tags, subtasks: draft.subtasks });
+    updateTask(editingId, { title, notes, priority: draft.priority, status: draft.status, date: draft.date, time: draft.time, repeat: draft.repeat, repeatEvery: draft.repeatEvery, repeatUntil: draft.repeatUntil, projectId: draft.projectId, tags: draft.tags, subtasks: draft.subtasks });
   } else {
-    addTask({ title, notes, priority: draft.priority, status: draft.status, date: draft.date, repeat: draft.repeat, projectId: draft.projectId, tags: draft.tags, subtasks: draft.subtasks });
+    addTask({ title, notes, priority: draft.priority, status: draft.status, date: draft.date, time: draft.time, repeat: draft.repeat, repeatEvery: draft.repeatEvery, repeatUntil: draft.repeatUntil, projectId: draft.projectId, tags: draft.tags, subtasks: draft.subtasks });
   }
   closeSheet();
   render();
@@ -1725,6 +1961,10 @@ function renderSettings() {
   html += `<input type="file" id="restore-file" accept="application/json,.json" style="display:none" onchange="restoreBackup(event)">`;
   html += `<div id="restore-status"></div>`;
   html += `<button class="data-btn danger" onclick="clearAllData()">Delete all data</button>`;
+  html += `</div>`;
+
+  html += `<div class="settings-section"><h3>Notifications</h3>`;
+  html += `<button class="data-btn" onclick="enableNotifications()">Enable due-time reminders + daily digest</button>`;
   html += `</div>`;
 
   // About
@@ -1876,8 +2116,73 @@ function focusSearch() {
   setSidebarOpen(true);
 }
 
+function archiveCompletedIfOld() {
+  const cutoffDays = Math.max(state.archiveAfterDays || 30, 1);
+  const cutoff = Date.now() - cutoffDays * 86400000;
+  let changed = false;
+  state.tasks.forEach(t => {
+    if (!t.archived && t.status === "done" && t.completedAt && t.completedAt < cutoff) {
+      t.archived = true;
+      changed = true;
+    }
+  });
+  if (changed) save();
+}
+function nextDueTask() {
+  const now = Date.now();
+  let winner = null;
+  state.tasks.forEach(t => {
+    if (t.archived || t.status === "done" || !t.date || !t.time) return;
+    const at = new Date(`${t.date}T${t.time}:00`).getTime();
+    if (!Number.isFinite(at) || at <= now) return;
+    if (!winner || at < winner.at) winner = { task: t, at };
+  });
+  return winner;
+}
+function scheduleDueReminder() {
+  if (dueTimer) clearTimeout(dueTimer);
+  if (!state.notifications?.due || Notification.permission !== "granted") return;
+  const next = nextDueTask();
+  if (!next) return;
+  const delay = Math.min(Math.max(next.at - Date.now(), 1000), 2147483647);
+  dueTimer = setTimeout(() => {
+    const t = next.task;
+    if (t.notifiedDueAt !== t.date + (t.time || "")) {
+      new Notification("Task due now", { body: t.title });
+      t.notifiedDueAt = t.date + (t.time || "");
+      save();
+    }
+    scheduleDueReminder();
+  }, delay);
+}
+function scheduleDailyDigest() {
+  if (digestTimer) clearTimeout(digestTimer);
+  if (!state.notifications?.digest || Notification.permission !== "granted") return;
+  const dueToday = state.tasks.filter(t => !t.archived && t.status !== "done" && t.date === todayIso()).length;
+  if (state.notifications.lastDigestDate !== todayIso() && dueToday > 0) {
+    new Notification("Todev daily digest", { body: `${dueToday} task${dueToday === 1 ? "" : "s"} due today` });
+    state.notifications.lastDigestDate = todayIso();
+    save();
+  }
+  digestTimer = setTimeout(scheduleDailyDigest, 3600000);
+}
+async function enableNotifications() {
+  if (!("Notification" in window)) return;
+  if (Notification.permission === "default") {
+    const perm = await Notification.requestPermission();
+    if (perm !== "granted") return;
+  }
+  state.notifications.due = true;
+  state.notifications.digest = true;
+  save();
+  scheduleDueReminder();
+  scheduleDailyDigest();
+  showToast("Notifications enabled", () => {});
+}
+
 // --- Main render ---
 function render() {
+  archiveCompletedIfOld();
   renderSidebar();
   if (tab === "list") renderTaskList();
   else renderCalendar();
@@ -1903,6 +2208,8 @@ function init() {
   document.getElementById("search-input").addEventListener("input", e => { search = e.target.value; render(); });
   // Render
   render();
+  scheduleDueReminder();
+  scheduleDailyDigest();
 }
 
 function seedDemo() {
