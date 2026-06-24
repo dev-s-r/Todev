@@ -647,6 +647,7 @@ const PRIORITY_ORDER = { high: 0, medium: 1, low: 2, none: 3 };
 
 const WEEKDAYS = ["sunday","monday","tuesday","wednesday","thursday","friday","saturday"];
 const WEEKDAYS_SHORT = ["sun","mon","tue","wed","thu","fri","sat"];
+const MAX_TIMEOUT_MS = 2147483647; // Browser-safe max delay for setTimeout (~24.8 days)
 
 // --- State ---
 let state = {
@@ -782,7 +783,7 @@ function nextWeekday(targetDow, from) {
 function advanceRecurringDate(iso, repeat, repeatEvery) {
   if (repeat === "none") return null;
   const every = Math.max(repeatEvery || 1, 1);
-  if (repeat === "daily") return addDays(iso, 1 * every);
+  if (repeat === "daily") return addDays(iso, every);
   if (repeat === "weekly") return addDays(iso, 7 * every);
   if (repeat === "monthly") return addMonths(iso, 1 * every);
   if (repeat === "weekdays") {
@@ -811,7 +812,8 @@ function parseQuickAdd(raw) {
   if (everyMatch) {
     const intervalRaw = (everyMatch[1] || "").trim();
     const word = everyMatch[2].toLowerCase();
-    repeatEvery = Math.max(parseInt(intervalRaw || "1", 10), 1);
+    const parsedInterval = parseInt(intervalRaw || "1", 10);
+    repeatEvery = Number.isFinite(parsedInterval) ? Math.max(parsedInterval, 1) : 1;
     if (word === "day") repeat = "daily";
     else if (word === "week") repeat = "weekly";
     else if (word === "month") repeat = "monthly";
@@ -829,6 +831,7 @@ function parseQuickAdd(raw) {
       const h = parseInt(timeMatch[1], 10);
       const m = parseInt(timeMatch[2] || "0", 10);
       const ampm = timeMatch[3].toLowerCase();
+      // Convert 12-hour value to 24-hour value (12 AM -> 0, 12 PM -> 12).
       let hh = h % 12;
       if (ampm === "pm") hh += 12;
       time = `${String(hh).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
@@ -2144,7 +2147,7 @@ function scheduleDueReminder() {
   if (!state.notifications?.due || Notification.permission !== "granted") return;
   const next = nextDueTask();
   if (!next) return;
-  const delay = Math.min(Math.max(next.at - Date.now(), 1000), 2147483647);
+  const delay = Math.min(Math.max(next.at - Date.now(), 1000), MAX_TIMEOUT_MS);
   dueTimer = setTimeout(() => {
     const t = next.task;
     if (t.notifiedDueAt !== t.date + (t.time || "")) {
