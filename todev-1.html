@@ -13,6 +13,7 @@
 <style>
   :root {
     --radius: 0.875rem;
+    --sheet-max-height: 760px;
     --bg: oklch(0.99 0.002 90);
     --fg: oklch(0.18 0.005 90);
     --card: oklch(1 0 0);
@@ -301,7 +302,7 @@
     position: fixed; left: 0; right: 0; bottom: 0; z-index: 50;
     max-width: 480px; margin: 0 auto; background: var(--bg);
     border-radius: 20px 20px 0 0; box-shadow: 0 -8px 32px rgba(0,0,0,0.2);
-    height: min(90vh, 760px); overflow-y: auto;
+    height: min(90vh, var(--sheet-max-height)); overflow-y: auto;
     overscroll-behavior: contain;
     transform: translate3d(0, 100%, 0); transition: transform 0.25s cubic-bezier(0.32, 0.72, 0, 1);
     will-change: transform;
@@ -647,7 +648,11 @@ const PRIORITY_ORDER = { high: 0, medium: 1, low: 2, none: 3 };
 
 const WEEKDAYS = ["sunday","monday","tuesday","wednesday","thursday","friday","saturday"];
 const WEEKDAYS_SHORT = ["sun","mon","tue","wed","thu","fri","sat"];
-const MAX_TIMEOUT_MS = 2147483647; // Browser-safe max delay for setTimeout (~24.8 days)
+const MAX_TIMEOUT_MS = 2147483647; // Max signed 32-bit int; higher setTimeout values can overflow/fail.
+const DAY_MS = 86400000;
+const HOUR_MS = 3600000;
+const MIN_REMINDER_DELAY_MS = 1000;
+const FOCUS_TASK_LIMIT = 3;
 
 // --- State ---
 let state = {
@@ -738,6 +743,7 @@ function fmtTime(value) {
   if (mins === null) return "";
   const h24 = Math.floor(mins / 60);
   const m = mins % 60;
+  // Convert 0-23 to 1-12, preserving midnight/noon as 12.
   const h12 = ((h24 + 11) % 12) + 1;
   const ampm = h24 >= 12 ? "PM" : "AM";
   return `${h12}:${String(m).padStart(2, "0")} ${ampm}`;
@@ -759,7 +765,7 @@ function fmtDate(iso) {
   if (iso === today) return "Today";
   if (iso === addDays(today, 1)) return "Tomorrow";
   if (iso === addDays(today, -1)) return "Yesterday";
-  const diff = Math.round((d - parseIso(today)) / 86400000);
+  const diff = Math.round((d - parseIso(today)) / DAY_MS);
   if (diff > 0 && diff < 7) return d.toLocaleDateString(undefined, { weekday: "long" });
   return d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
 }
@@ -785,7 +791,7 @@ function advanceRecurringDate(iso, repeat, repeatEvery) {
   const every = Math.max(repeatEvery || 1, 1);
   if (repeat === "daily") return addDays(iso, every);
   if (repeat === "weekly") return addDays(iso, 7 * every);
-  if (repeat === "monthly") return addMonths(iso, 1 * every);
+  if (repeat === "monthly") return addMonths(iso, every);
   if (repeat === "weekdays") {
     const d = parseIso(iso); if (!d) return addDays(iso, 1);
     const dow = d.getDay();
@@ -807,6 +813,7 @@ function parseQuickAdd(raw) {
     priority = priMatch[1].toLowerCase();
     text = text.slice(0, priMatch.index) + text.slice(priMatch.index + priMatch[0].length);
   }
+  // Matches "every day", "every 2 weeks", "every monday", etc.
   const everyMatch = text.match(/\bevery\s+(\d+\s+)?(day|week|month|weekday|monday|tuesday|wednesday|thursday|friday|saturday|sunday)s?\b/i);
   let everyWeekdayIdx = null;
   if (everyMatch) {
@@ -948,7 +955,7 @@ function updateTask(id, patch) {
 }
 function deleteTask(id) {
   const cutoffDays = Math.max(state.archiveAfterDays || 30, 1);
-  const cutoffMs = cutoffDays * 86400000;
+  const cutoffMs = cutoffDays * DAY_MS;
   const t = state.tasks.find(x => x.id === id);
   if (t && t.status === "done" && t.completedAt && (Date.now() - t.completedAt) >= cutoffMs) {
     t.archived = true;
@@ -1084,7 +1091,7 @@ function getFilteredTasks() {
         case "upcoming": list = base.filter(t => t.date && t.date > today && t.date <= next7); break;
         case "anytime": list = base.filter(t => !t.date && t.priority !== "none"); break;
         case "someday": list = base.filter(t => !t.date && t.priority === "none"); break;
-        case "focus": list = base.filter(t => t.status !== "done").slice(); break;
+        case "focus": list = base.filter(t => t.status !== "done"); break;
         case "completed": list = base.filter(t => t.status === "done"); break;
         default: list = base.slice(); break;
       }
@@ -1133,7 +1140,7 @@ function getFilteredTasks() {
     if (!a.date && b.date) return 1;
     return a.order - b.order;
   });
-  if (selection.kind === "smart" && selection.id === "focus") list = list.slice(0, 3);
+  if (selection.kind === "smart" && selection.id === "focus") list = list.slice(0, FOCUS_TASK_LIMIT);
   return list;
 }
 
@@ -1161,7 +1168,7 @@ function renderSidebar() {
     { id: "inbox", label: "Inbox", icon: inboxIcon(), count: counts.inbox },
     { id: "today", label: "Today", icon: todayIcon(), count: counts.today, color: "var(--today-accent)" },
     { id: "upcoming", label: "Upcoming", icon: upcomingIcon(), count: counts.upcoming },
-    { id: "focus", label: "Focus", icon: todayIcon(), count: Math.min(counts.focus, 3), color: "var(--today-accent)" },
+    { id: "focus", label: "Focus", icon: todayIcon(), count: Math.min(counts.focus, FOCUS_TASK_LIMIT), color: "var(--today-accent)" },
     { id: "anytime", label: "Anytime", icon: anytimeIcon(), count: counts.anytime },
     { id: "someday", label: "Someday", icon: somedayIcon(), count: counts.someday },
     { id: "all", label: "All Tasks", icon: allIcon(), count: counts.all },
@@ -1230,6 +1237,8 @@ function somedayIcon() { return '<svg width="17" height="17" viewBox="0 0 24 24"
 function completedIcon() { return '<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>'; }
 function allIcon() { return '<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg>'; }
 function checkIcon() { return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>'; }
+function bellIcon() { return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M15 17h5l-1.4-1.4A2 2 0 0 1 18 14.2V11a6 6 0 1 0-12 0v3.2a2 2 0 0 1-.6 1.4L4 17h5"/><path d="M9 17a3 3 0 0 0 6 0"/></svg>'; }
+function selectIcon() { return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M8 12l2.5 2.5L16 9"/></svg>'; }
 function editPencilIcon() { return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.85 2.85 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5z"/></svg>'; }
 function layersIcon() { return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 22 8 12 14 2 8 12 2"/><polyline points="2 12.5 12 18.5 22 12.5"/><polyline points="2 17 12 23 22 17"/></svg>'; }
 function trashIcon() { return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-2 14a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2L5 6"/></svg>'; }
@@ -1609,7 +1618,7 @@ function openTaskMenu(taskId) {
   closeSheet();
   menuTaskId = taskId;
   const done = t.status === "done";
-  const tomorrow = isoDate(new Date(Date.now() + 86400000));
+  const tomorrow = isoDate(new Date(Date.now() + DAY_MS));
   document.getElementById("task-menu").innerHTML = `
     <div class="task-menu-title">${esc(t.title)}</div>
     <div class="task-menu-divider"></div>
@@ -1617,9 +1626,9 @@ function openTaskMenu(taskId) {
     <button class="task-menu-item" onclick="taskMenuAction('edit')">${editPencilIcon()}<span>Edit details</span></button>
     <button class="task-menu-item" onclick="taskMenuAction('today')">${todayIcon()}<span>Move to Today</span></button>
     <button class="task-menu-item" onclick="taskMenuAction('tomorrow')">${upcomingIcon()}<span>Move to Tomorrow</span></button>
-    <button class="task-menu-item" onclick="taskMenuAction('snooze')">${upcomingIcon()}<span>Snooze to tomorrow</span></button>
+    <button class="task-menu-item" onclick="taskMenuAction('snooze')">${bellIcon()}<span>Snooze to tomorrow</span></button>
     <button class="task-menu-item" onclick="taskMenuAction('anytime')">${layersIcon()}<span>Move to Anytime</span></button>
-    <button class="task-menu-item" onclick="taskMenuAction('select')">${layersIcon()}<span>Select multiple</span></button>
+    <button class="task-menu-item" onclick="taskMenuAction('select')">${selectIcon()}<span>Select multiple</span></button>
     <div class="task-menu-divider"></div>
     <button class="task-menu-item destructive" onclick="taskMenuAction('delete')">${trashIcon()}<span>Delete</span></button>
   `;
@@ -1644,9 +1653,9 @@ function taskMenuAction(action) {
   } else if (action === "today") {
     updateTask(id, { date: todayIso() }); render();
   } else if (action === "tomorrow") {
-    updateTask(id, { date: isoDate(new Date(Date.now() + 86400000)) }); render();
+    updateTask(id, { date: isoDate(new Date(Date.now() + DAY_MS)) }); render();
   } else if (action === "snooze") {
-    updateTask(id, { date: isoDate(new Date(Date.now() + 86400000)), status: "pending" }); render();
+    updateTask(id, { date: isoDate(new Date(Date.now() + DAY_MS)), status: "pending" }); render();
   } else if (action === "anytime") {
     updateTask(id, { date: null, priority: t.priority === "none" ? "low" : t.priority }); render();
   } else if (action === "select") {
@@ -1751,7 +1760,7 @@ function renderSheet() {
       });
       html += `</div></div>`;
       if (draft.repeat !== "none") {
-        html += `<div class="field-row"><div class="field-label">Every</div><div class="chips"><input type="number" min="1" max="52" value="${draft.repeatEvery || 1}" style="width:72px;background:var(--muted);border:none;border-radius:8px;padding:7px 10px;color:var(--fg)" onchange="setRepeatEvery(this.value)"><span style="font-size:12px;color:var(--muted-fg)">interval</span></div></div>`;
+        html += `<div class="field-row"><div class="field-label">Every</div><div class="chips"><input type="number" min="1" max="52" title="Up to 52 keeps recurrence intervals practical" value="${draft.repeatEvery || 1}" style="width:72px;background:var(--muted);border:none;border-radius:8px;padding:7px 10px;color:var(--fg)" onchange="setRepeatEvery(this.value)"><span style="font-size:12px;color:var(--muted-fg)">interval</span></div></div>`;
         html += `<div class="field-row"><div class="field-label">End</div><div class="chips"><input type="date" value="${draft.repeatUntil || ""}" style="background:var(--muted);border:none;border-radius:8px;padding:7px 10px;color:var(--fg)" onchange="setRepeatUntil(this.value)"><button class="chip" onclick="setRepeatUntil('')">None</button></div></div>`;
       }
     }
@@ -2121,7 +2130,7 @@ function focusSearch() {
 
 function archiveCompletedIfOld() {
   const cutoffDays = Math.max(state.archiveAfterDays || 30, 1);
-  const cutoff = Date.now() - cutoffDays * 86400000;
+  const cutoff = Date.now() - cutoffDays * DAY_MS;
   let changed = false;
   state.tasks.forEach(t => {
     if (!t.archived && t.status === "done" && t.completedAt && t.completedAt < cutoff) {
@@ -2136,6 +2145,7 @@ function nextDueTask() {
   let winner = null;
   state.tasks.forEach(t => {
     if (t.archived || t.status === "done" || !t.date || !t.time) return;
+    if (parseTimeToMinutes(t.time) === null) return;
     const at = new Date(`${t.date}T${t.time}:00`).getTime();
     if (!Number.isFinite(at) || at <= now) return;
     if (!winner || at < winner.at) winner = { task: t, at };
@@ -2147,7 +2157,7 @@ function scheduleDueReminder() {
   if (!state.notifications?.due || Notification.permission !== "granted") return;
   const next = nextDueTask();
   if (!next) return;
-  const delay = Math.min(Math.max(next.at - Date.now(), 1000), MAX_TIMEOUT_MS);
+  const delay = Math.min(Math.max(next.at - Date.now(), MIN_REMINDER_DELAY_MS), MAX_TIMEOUT_MS);
   dueTimer = setTimeout(() => {
     const t = next.task;
     if (t.notifiedDueAt !== t.date + (t.time || "")) {
@@ -2167,7 +2177,7 @@ function scheduleDailyDigest() {
     state.notifications.lastDigestDate = todayIso();
     save();
   }
-  digestTimer = setTimeout(scheduleDailyDigest, 3600000);
+  digestTimer = setTimeout(scheduleDailyDigest, HOUR_MS);
 }
 async function enableNotifications() {
   if (!("Notification" in window)) return;
